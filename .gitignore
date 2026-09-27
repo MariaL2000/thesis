@@ -1,0 +1,17 @@
+# Entornos virtuales
+venv/
+env/
+__pycache__/
+
+# Base de datos local (si usas SQLite)
+*.sqlite
+*.analisis_bio
+
+# Archivos de datos de usuarios y secuencias pesadas
+data/Secuencias/
+*.fasta.gz
+*.fastq
+
+# Archivos del sistema
+.DS_Store
+.env
