@@ -129,23 +129,27 @@ También: `GET /api/v1/input-summary/{user_id}`
 
 ### 3) Comparar con miRBase
 
+Asegúrate de tener `data/Secuencias/mature.fa` (copia completa de miRBase). El parser lee cabeceras del tipo:
+
+`cel-let-7-5p MIMAT0000001 Caenorhabditis elegans let-7-5p`
+
+y rellena `mirbase_id` + `species` (nombre completo) en matches **exact** y **seed**.
+
 `POST /api/v1/mirbase/comparar-guardados/`
 
 - Form: `user_id` = el de tu sesión
 
 Luego: `GET /api/v1/mirbase/estadisticas-clasificacion/{user_id}`
 
-Espera `status: completado` y revisa `tabla_muestra_resultados` (`match_type`: exact / seed / novel).
+Espera `status: completado` y revisa `tabla_muestra_resultados` (`mirbase_id`, `species`, `match_type`).
 
-### 4) Interacciones miRNA–mRNA
+### 4) Interacciones (si se quedaba cargando)
 
-`POST /api/v1/interaction/calcular-interacciones`
+El sitio en el mRNA se busca como **complemento reverso del seed** (no la misma secuencia). Además hay tope de miRNAs/transcritos para que el job termine.
 
-- Form: `user_id`, `max_pares_por_mirna` (ej. `5`)
+`POST /api/v1/interaction/calcular-interacciones` → `GET /api/v1/interaction/estadisticas-interaccion/{user_id}`
 
-Luego: `GET /api/v1/interaction/estadisticas-interaccion/{user_id}`
-
-Revisa candidatos, `label_source` (`unlabeled` / `synthetic_negative`) y features.
+Si `status` es `error`, mira `mensaje` / `detalle_error` del job.
 
 ### 5) Machine Learning
 

@@ -37,6 +37,29 @@ async def calcular_interacciones_endpoint(
             detail=f"No hay transcriptoma para el usuario {user_id}.",
         )
 
+    mirna_count = db.query(IdentifiedMirna).filter_by(user_id=user_id).count()
+    if mirna_count == 0:
+        raise HTTPException(
+            status_code=400,
+            detail="No hay miRNAs identificados. Ejecuta antes POST /mirbase/comparar-guardados/.",
+        )
+
+    # Registrar job ANTES del background para que el GET no se quede en 'cargando' eterno
+    job_nombre = f"Prediction Interaction - Run #{transcriptome.id}"
+    job = db.query(PipelineJobStatus).filter_by(user_id=user_id, tipo=job_nombre).first()
+    if not job:
+        job = PipelineJobStatus(
+            user_id=user_id,
+            archivo=f"transcriptome_{transcriptome.id}",
+            tipo=job_nombre,
+            estado="procesando",
+        )
+        db.add(job)
+    else:
+        job.estado = "procesando"
+        job.detalle_error = None
+    db.commit()
+
     background_tasks.add_task(
         procesar_interacciones_background, user_id, transcriptome.id, max_pares_por_mirna
     )
@@ -46,7 +69,9 @@ async def calcular_interacciones_endpoint(
         "user_id": user_id,
         "transcriptome_id": transcriptome.id,
         "archivo": transcriptome.archivo,
+        "mirnas_disponibles": mirna_count,
         "message": f"Cálculo de interacciones iniciado para '{transcriptome.archivo}'.",
+        "status_get": f"/api/v1/interaction/estadisticas-interaccion/{user_id}",
     }
 
 

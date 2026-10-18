@@ -1,7 +1,8 @@
 import gzip
+import re
 import time
 from pathlib import Path
-from typing import Dict, Set, Tuple
+from typing import Dict, Optional, Tuple
 
 from Bio import SeqIO
 
@@ -13,60 +14,122 @@ from app.services.disk_store import iter_collapsed_reads
 # Top-N novel por frecuencia a persistir (el resto queda solo en el TSV colapsado)
 MAX_NOVEL_TO_DB = 100
 
+# Entrada de índice: mirbase_id, mimat, species, sequence
+RefEntry = Dict[str, str]
+
+
+def parse_mirbase_header(description: str) -> Tuple[str, Optional[str], str]:
+    """
+    Parsea cabecera miRBase, p.ej.:
+      cel-let-7-5p MIMAT0000001 Caenorhabditis elegans let-7-5p
+      osa-miR156a MIMAT0000645 Oryza sativa
+
+    Retorna: (mirbase_id, mimat_id|None, species_nombre_completo)
+    """
+    parts = (description or "").strip().split()
+    if not parts:
+        return "unknown", None, "unknown"
+
+    mirbase_id = parts[0]
+    idx = 1
+    mimat = None
+    if idx < len(parts) and parts[idx].upper().startswith("MIMAT"):
+        mimat = parts[idx]
+        idx += 1
+
+    remaining = parts[idx:]
+    abbrev = mirbase_id.split("-")[0] if "-" in mirbase_id else mirbase_id
+
+    if not remaining:
+        return mirbase_id, mimat, abbrev
+
+    # Sufijo del producto (let-7-5p, miR156a, …) suele ir al final
+    product = mirbase_id.split("-", 1)[-1] if "-" in mirbase_id else ""
+    if len(remaining) >= 2 and (
+        remaining[-1] == product
+        or remaining[-1] in mirbase_id
+        or re.fullmatch(r"(miR|MIR|let|lin|lsy)[\w.-]*", remaining[-1], re.I)
+    ):
+        species = " ".join(remaining[:-1])
+    elif len(remaining) >= 2:
+        # Binomio científico por defecto (Genus species); si hay más palabras sin producto, úsalas
+        # p.ej. "Caenorhabditis elegans" o nombres más largos sin token de producto
+        species = " ".join(remaining)
+        # Si el último token parece ID corto (tiene dígitos y guiones), quitarlo
+        if re.search(r"\d", remaining[-1]) and "-" in remaining[-1]:
+            species = " ".join(remaining[:-1])
+    else:
+        species = remaining[0]
+
+    return mirbase_id, mimat, species.strip() or abbrev
+
 
 def cargar_referencia_mirbase(
     referencia_filename: str = MIRBASE_MATURE_FILENAME,
-) -> Tuple[Dict[str, str], Dict[str, str], Set[str]]:
+) -> Tuple[Dict[str, RefEntry], Dict[str, RefEntry]]:
     """
     Carga mature.fa una vez.
     Retorna:
-      - ids_upper → id original
-      - seq → id (índice hash para búsqueda O(1))
-      - seeds (nt 2–8) → usados solo como señal secundaria
+      - seq_index: secuencia (T y U) → {mirbase_id, mimat, species}
+      - seed_index: seed nt 2–8 → mismo dict (primer hit)
     """
     ruta_ref = SEQUENCES_DIR / referencia_filename
     if not ruta_ref.exists():
         ruta_ref = Path("data") / referencia_filename
 
-    miRBase_ref_ids: Dict[str, str] = {}
-    seq_to_id: Dict[str, str] = {}
-    miRBase_ref_seeds: Set[str] = set()
+    seq_index: Dict[str, RefEntry] = {}
+    seed_index: Dict[str, RefEntry] = {}
 
     if not ruta_ref.exists():
-        # Fallback mínimo para pruebas locales sin mature.fa
+        demo = {
+            "mirbase_id": "osa-miR156a",
+            "mimat": "MIMAT0000645",
+            "species": "Oryza sativa",
+        }
         return (
-            {"OSA-MIR156A": "osa-MIR156a"},
-            {"UGACAGAAGAGAGUGAGCAC": "osa-MIR156a"},
-            {"GACAGA"},
+            {"UGACAGAAGAGAGUGAGCAC": demo, "TGACAGAAGAGAGTGAGCAC": demo},
+            {"GACAGAAGAG": demo, "GACAGAA": demo},
         )
 
-    formato = "fasta"
     open_func = gzip.open if str(ruta_ref).endswith(".gz") else open
-    with open_func(ruta_ref, "rt") as f_ref:
-        for record in SeqIO.parse(f_ref, formato):
-            if not record.id or not record.seq:
+    with open_func(ruta_ref, "rt", encoding="utf-8", errors="replace") as f_ref:
+        for record in SeqIO.parse(f_ref, "fasta"):
+            if not record.seq:
                 continue
-            rid = record.id.split()[0]
-            seq = str(record.seq).upper().replace("U", "T")
-            miRBase_ref_ids[rid.upper()] = rid
-            # Preferir primer ID si hay colisiones de secuencia
-            seq_to_id.setdefault(seq, rid)
-            seq_u = seq.replace("T", "U")
-            seq_to_id.setdefault(seq_u, rid)
-            if len(seq) >= 8:
-                miRBase_ref_seeds.add(seq[1:8])
-                miRBase_ref_seeds.add(seq_u[1:8] if len(seq_u) >= 8 else seq[1:8])
+            desc = record.description or record.id or ""
+            mirbase_id, mimat, species = parse_mirbase_header(desc)
+            entry: RefEntry = {
+                "mirbase_id": mirbase_id,
+                "mimat": mimat or "",
+                "species": species,
+            }
+            seq_raw = str(record.seq).upper()
+            seq_t = seq_raw.replace("U", "T")
+            seq_u = seq_t.replace("T", "U")
 
-    print(f"-> Referencia '{referencia_filename}' indexada: {len(seq_to_id)} secuencias.")
-    return miRBase_ref_ids, seq_to_id, miRBase_ref_seeds
+            seq_index.setdefault(seq_t, entry)
+            seq_index.setdefault(seq_u, entry)
+            seq_index.setdefault(seq_raw, entry)
+
+            if len(seq_t) >= 8:
+                seed_t = seq_t[1:8]
+                seed_u = seq_u[1:8]
+                seed_index.setdefault(seed_t, entry)
+                seed_index.setdefault(seed_u, entry)
+
+    print(
+        f"-> miRBase '{ruta_ref}' indexada: {len(seq_index)//2} secuencias approx, "
+        f"{len(seed_index)} seeds."
+    )
+    return seq_index, seed_index
 
 
 def procesar_clasificacion_desde_db_background(
     user_id: int, referencia_filename: str = MIRBASE_MATURE_FILENAME
 ):
     """
-    Lee lecturas colapsadas desde disco (no desde DB), busca en índice hash de mature.fa
-    y persiste solo matches + top-N novel.
+    Lee lecturas colapsadas desde disco, busca en índice hash de mature.fa
+    y persiste matches con mirbase_id + species correctos (+ top-N novel).
     """
     db = SessionLocal()
     try:
@@ -75,7 +138,7 @@ def procesar_clasificacion_desde_db_background(
         print("=" * 60)
 
         t_inicio = time.time()
-        _ids, seq_to_id, seeds = cargar_referencia_mirbase(referencia_filename)
+        seq_index, seed_index = cargar_referencia_mirbase(referencia_filename)
 
         summaries = (
             db.query(MirnaInputSummary)
@@ -85,9 +148,13 @@ def procesar_clasificacion_desde_db_background(
         )
         if not summaries:
             print(f"No hay resumen de miRNA (collapsed) para el usuario {user_id}.")
+            db.query(PipelineJobStatus).filter(
+                PipelineJobStatus.user_id == user_id,
+                PipelineJobStatus.tipo == "miRBase Classification",
+            ).update({"estado": "error", "detalle_error": "Sin MirnaInputSummary"})
+            db.commit()
             return
 
-        # Usar el resumen más reciente por archivo
         seen_files = set()
         latest = []
         for s in summaries:
@@ -103,7 +170,7 @@ def procesar_clasificacion_desde_db_background(
         BATCH_SIZE = 2000
         total_procesados = 0
         total_conocidos = 0
-        novels_buffer = []  # (read_count, payload)
+        novels_buffer = []
 
         for summary in latest:
             collapsed = Path(summary.collapsed_path)
@@ -116,16 +183,19 @@ def procesar_clasificacion_desde_db_background(
                 seq_u = seq_norm.replace("T", "U")
                 total_procesados += 1
 
-                mirbase_id = seq_to_id.get(seq_norm) or seq_to_id.get(seq_u) or seq_to_id.get(seq.upper())
-                if mirbase_id:
-                    species = mirbase_id.split("-")[0].lower() if "-" in mirbase_id else None
+                entry = (
+                    seq_index.get(seq_norm)
+                    or seq_index.get(seq_u)
+                    or seq_index.get(seq.upper())
+                )
+                if entry:
                     batch.append(
                         {
                             "user_id": user_id,
-                            "mirna_id": rep_id or mirbase_id,
-                            "mirbase_id": mirbase_id,
-                            "mirna_sequence": seq.upper(),
-                            "species": species,
+                            "mirna_id": rep_id or entry["mirbase_id"],
+                            "mirbase_id": entry["mirbase_id"],
+                            "mirna_sequence": seq.upper().replace("T", "U"),
+                            "species": entry["species"],
                             "read_count": read_count,
                             "match_type": "exact",
                             "mismatches": 0,
@@ -136,14 +206,15 @@ def procesar_clasificacion_desde_db_background(
                     total_conocidos += 1
                 else:
                     seed = seq_norm[1:8] if len(seq_norm) >= 8 else seq_norm
-                    if seed in seeds:
+                    seed_entry = seed_index.get(seed) or seed_index.get(seed.replace("T", "U"))
+                    if seed_entry:
                         batch.append(
                             {
                                 "user_id": user_id,
-                                "mirna_id": rep_id or f"seed_{seed}",
-                                "mirbase_id": None,
-                                "mirna_sequence": seq.upper(),
-                                "species": None,
+                                "mirna_id": rep_id or seed_entry["mirbase_id"],
+                                "mirbase_id": seed_entry["mirbase_id"],
+                                "mirna_sequence": seq.upper().replace("T", "U"),
+                                "species": seed_entry["species"],
                                 "read_count": read_count,
                                 "match_type": "seed",
                                 "mismatches": 0,
@@ -160,7 +231,7 @@ def procesar_clasificacion_desde_db_background(
                                     "user_id": user_id,
                                     "mirna_id": rep_id or f"novel_{total_procesados}",
                                     "mirbase_id": None,
-                                    "mirna_sequence": seq.upper(),
+                                    "mirna_sequence": seq.upper().replace("T", "U"),
                                     "species": None,
                                     "read_count": read_count,
                                     "match_type": "novel",
@@ -176,7 +247,6 @@ def procesar_clasificacion_desde_db_background(
                     db.commit()
                     batch = []
 
-        # Solo top-N novel por frecuencia → DB
         novels_buffer.sort(key=lambda x: x[0], reverse=True)
         for _, payload in novels_buffer[:MAX_NOVEL_TO_DB]:
             batch.append(payload)
@@ -197,9 +267,9 @@ def procesar_clasificacion_desde_db_background(
 
         t_total = time.time() - t_inicio
         print(
-            f"Clasificación OK user={user_id}: {total_procesados:,} secuencias únicas, "
-            f"{total_conocidos:,} conocidos/seed, "
-            f"{min(len(novels_buffer), MAX_NOVEL_TO_DB)} novel en DB "
+            f"Clasificación OK user={user_id}: {total_procesados:,} únicas, "
+            f"{total_conocidos:,} con mirbase_id/species, "
+            f"{min(len(novels_buffer), MAX_NOVEL_TO_DB)} novel "
             f"({t_total:.2f}s)"
         )
 
