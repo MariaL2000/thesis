@@ -1,163 +1,215 @@
 import gzip
 import time
 from pathlib import Path
-from typing import Tuple, Set, Dict
+from typing import Dict, Set, Tuple
+
 from Bio import SeqIO
-from sqlalchemy import func
 
+from app.core.config import MIRBASE_MATURE_FILENAME, SEQUENCES_DIR
+from app.models.models import IdentifiedMirna, MirnaInputSummary, PipelineJobStatus
 from app.services.database import SessionLocal
-from app.models.models import MirnaReport, MirnaClassificationReport, PipelineJobStatus
+from app.services.disk_store import iter_collapsed_reads
 
-UPLOAD_DIR = Path("data/Secuencias")
+# Top-N novel por frecuencia a persistir (el resto queda solo en el TSV colapsado)
+MAX_NOVEL_TO_DB = 100
 
 
-def cargar_referencia_mirbase(referencia_filename: str = "mature.fa") -> Tuple[Dict[str, str], Set[str], Set[str]]:
-    """Carga los IDs, secuencias exactas y regiones seed válidas desde el archivo local de miRBase."""
-    ruta_ref = UPLOAD_DIR / referencia_filename
+def cargar_referencia_mirbase(
+    referencia_filename: str = MIRBASE_MATURE_FILENAME,
+) -> Tuple[Dict[str, str], Dict[str, str], Set[str]]:
+    """
+    Carga mature.fa una vez.
+    Retorna:
+      - ids_upper → id original
+      - seq → id (índice hash para búsqueda O(1))
+      - seeds (nt 2–8) → usados solo como señal secundaria
+    """
+    ruta_ref = SEQUENCES_DIR / referencia_filename
     if not ruta_ref.exists():
         ruta_ref = Path("data") / referencia_filename
 
-    miRBase_ref_ids = {}
-    miRBase_ref_seqs = set()
-    miRBase_ref_seeds = set()
-    
-    if ruta_ref.exists():
-        formato = "fastq" if "fastq" in referencia_filename.lower() or "fq" in referencia_filename.lower() else "fasta"
-        open_func = gzip.open if referencia_filename.endswith(".gz") else open
-        
-        try:
-            with open_func(ruta_ref, "rt") as f_ref:
-                for record in SeqIO.parse(f_ref, formato):
-                    if record.id:
-                        clean_id = record.id.split()[0].upper()
-                        miRBase_ref_ids[clean_id] = record.id.split()[0]
-                    if record.seq:
-                        seq_str = str(record.seq).upper()
-                        miRBase_ref_seqs.add(seq_str)
-                        if len(seq_str) >= 8:
-                            miRBase_ref_seeds.add(seq_str[1:8]) # Región seed estándar (posiciones 2 a 8)
-            print(f"-> Referencia '{referencia_filename}' cargada con éxito desde disco.")
-        except Exception as e:
-            raise ValueError(f"Error al leer el archivo de referencia {referencia_filename}: {str(e)}")
-    else:
-        # Fallback de seguridad si no existe el archivo físico
-        miRBase_ref_ids = {"OSA-MIR156A": "osa-MIR156a", "OSA-MIR168A": "osa-MIR168a"}
-        miRBase_ref_seqs = {"TGACGAG", "TCGCGG"}
-        miRBase_ref_seeds = {"GACG", "CGCG"}
-        
-    return miRBase_ref_ids, miRBase_ref_seqs, miRBase_ref_seeds
+    miRBase_ref_ids: Dict[str, str] = {}
+    seq_to_id: Dict[str, str] = {}
+    miRBase_ref_seeds: Set[str] = set()
+
+    if not ruta_ref.exists():
+        # Fallback mínimo para pruebas locales sin mature.fa
+        return (
+            {"OSA-MIR156A": "osa-MIR156a"},
+            {"UGACAGAAGAGAGUGAGCAC": "osa-MIR156a"},
+            {"GACAGA"},
+        )
+
+    formato = "fasta"
+    open_func = gzip.open if str(ruta_ref).endswith(".gz") else open
+    with open_func(ruta_ref, "rt") as f_ref:
+        for record in SeqIO.parse(f_ref, formato):
+            if not record.id or not record.seq:
+                continue
+            rid = record.id.split()[0]
+            seq = str(record.seq).upper().replace("U", "T")
+            miRBase_ref_ids[rid.upper()] = rid
+            # Preferir primer ID si hay colisiones de secuencia
+            seq_to_id.setdefault(seq, rid)
+            seq_u = seq.replace("T", "U")
+            seq_to_id.setdefault(seq_u, rid)
+            if len(seq) >= 8:
+                miRBase_ref_seeds.add(seq[1:8])
+                miRBase_ref_seeds.add(seq_u[1:8] if len(seq_u) >= 8 else seq[1:8])
+
+    print(f"-> Referencia '{referencia_filename}' indexada: {len(seq_to_id)} secuencias.")
+    return miRBase_ref_ids, seq_to_id, miRBase_ref_seeds
 
 
-def procesar_clasificacion_desde_db_background(user_id: int, referencia_filename: str = "mature.fa"):
+def procesar_clasificacion_desde_db_background(
+    user_id: int, referencia_filename: str = MIRBASE_MATURE_FILENAME
+):
     """
-    Tarea en segundo plano que procesa los registros de un usuario específico comparándolos con mature.fa, 
-    guarda los resultados (conocidos y novel) en la BD y actualiza el estado del job a 'completado'.
+    Lee lecturas colapsadas desde disco (no desde DB), busca en índice hash de mature.fa
+    y persiste solo matches + top-N novel.
     """
     db = SessionLocal()
     try:
-        print("\n" + "="*60)
-        print(f"🚀 INICIANDO CLASIFICACIÓN CONTRA MIＲBASE PARA EL USUARIO ID: {user_id}")
-        print("="*60)
-        
-        t_inicio = time.time()
-        mirbase_ids_dict, mirbase_seqs, mirbase_seeds = cargar_referencia_mirbase(referencia_filename)
+        print("\n" + "=" * 60)
+        print(f"INICIANDO CLASIFICACIÓN miRBase PARA USUARIO ID: {user_id}")
+        print("=" * 60)
 
-        # 1. Identificar la fecha de la última carga masiva en la BD para este usuario específico
-        ultima_fecha = db.query(func.max(MirnaReport.fecha)).filter(MirnaReport.user_id == user_id).scalar()
-        if not ultima_fecha:
-            print(f"⚠️ [Background] No hay registros en la BD para clasificar del usuario {user_id}.")
+        t_inicio = time.time()
+        _ids, seq_to_id, seeds = cargar_referencia_mirbase(referencia_filename)
+
+        summaries = (
+            db.query(MirnaInputSummary)
+            .filter(MirnaInputSummary.user_id == user_id)
+            .order_by(MirnaInputSummary.id.desc())
+            .all()
+        )
+        if not summaries:
+            print(f"No hay resumen de miRNA (collapsed) para el usuario {user_id}.")
             return
 
-        # 2. Limpiar reportes de clasificación anteriores de este usuario para que no se mezclen
-        db.query(MirnaClassificationReport).filter(MirnaClassificationReport.user_id == user_id).delete()
+        # Usar el resumen más reciente por archivo
+        seen_files = set()
+        latest = []
+        for s in summaries:
+            if s.archivo in seen_files:
+                continue
+            seen_files.add(s.archivo)
+            latest.append(s)
+
+        db.query(IdentifiedMirna).filter(IdentifiedMirna.user_id == user_id).delete()
         db.commit()
 
-        # 3. Filtrar SÓLO los registros que pertenecen a esa última tanda de este usuario
-        registros_bd = db.query(MirnaReport).filter(
-            MirnaReport.user_id == user_id,
-            MirnaReport.fecha == ultima_fecha
-        ).all()
-        
-        if not registros_bd:
-            print(f"⚠️ [Background] No se encontraron registros recientes para la sesión actual del usuario {user_id}.")
-            return
-
-        print(f"📊 Total de registros recientes recuperados para clasificar (Usuario {user_id}): {len(registros_bd):,}")
-
-        batch_data = []
-        BATCH_SIZE = 5000
+        batch = []
+        BATCH_SIZE = 2000
         total_procesados = 0
+        total_conocidos = 0
+        novels_buffer = []  # (read_count, payload)
 
-        for item in registros_bd:
-            mirna_id = getattr(item, "miRNA", "Desconocido")
-            secuencia = str(getattr(item, "secuencia", "")).upper().replace("N", "")
-            nombre_archivo = getattr(item, "archivo", "desconocido")
-
-            if not secuencia:
+        for summary in latest:
+            collapsed = Path(summary.collapsed_path)
+            if not collapsed.exists():
+                print(f"AVISO: no existe {collapsed}")
                 continue
 
-            estado = "Potencialmente Novedoso (Novel miRNA)"
-            match_identificado = mirna_id
+            for seq, read_count, rep_id in iter_collapsed_reads(collapsed):
+                seq_norm = seq.upper().replace("U", "T")
+                seq_u = seq_norm.replace("T", "U")
+                total_procesados += 1
 
-            # Algoritmo de comparación jerárquica con miRBase (mature.fa)
-            if mirna_id.upper() in mirbase_ids_dict:
-                real_id = mirbase_ids_dict[mirna_id.upper()]
-                especie = real_id.split("-")[0].lower() if "-" in real_id else "global"
-                estado = f"Conocido ({especie.upper()} - ID Exacto: {real_id})"
-                match_identificado = real_id
-            elif secuencia in mirbase_seqs:
-                estado = "Conocido (miRBase - Coincidencia de Secuencia Exacta)"
-            else:
-                seed = secuencia[1:8] if len(secuencia) >= 8 else secuencia
-                if seed in mirbase_seeds:
-                    estado = "Conocido (miRBase - Homología por Región Seed)"
+                mirbase_id = seq_to_id.get(seq_norm) or seq_to_id.get(seq_u) or seq_to_id.get(seq.upper())
+                if mirbase_id:
+                    species = mirbase_id.split("-")[0].lower() if "-" in mirbase_id else None
+                    batch.append(
+                        {
+                            "user_id": user_id,
+                            "mirna_id": rep_id or mirbase_id,
+                            "mirbase_id": mirbase_id,
+                            "mirna_sequence": seq.upper(),
+                            "species": species,
+                            "read_count": read_count,
+                            "match_type": "exact",
+                            "mismatches": 0,
+                            "alignment_score": 1.0,
+                            "source_file": summary.archivo,
+                        }
+                    )
+                    total_conocidos += 1
+                else:
+                    seed = seq_norm[1:8] if len(seq_norm) >= 8 else seq_norm
+                    if seed in seeds:
+                        batch.append(
+                            {
+                                "user_id": user_id,
+                                "mirna_id": rep_id or f"seed_{seed}",
+                                "mirbase_id": None,
+                                "mirna_sequence": seq.upper(),
+                                "species": None,
+                                "read_count": read_count,
+                                "match_type": "seed",
+                                "mismatches": 0,
+                                "alignment_score": 0.7,
+                                "source_file": summary.archivo,
+                            }
+                        )
+                        total_conocidos += 1
+                    else:
+                        novels_buffer.append(
+                            (
+                                read_count,
+                                {
+                                    "user_id": user_id,
+                                    "mirna_id": rep_id or f"novel_{total_procesados}",
+                                    "mirbase_id": None,
+                                    "mirna_sequence": seq.upper(),
+                                    "species": None,
+                                    "read_count": read_count,
+                                    "match_type": "novel",
+                                    "mismatches": 0,
+                                    "alignment_score": 0.0,
+                                    "source_file": summary.archivo,
+                                },
+                            )
+                        )
 
-            # TODOS (conocidos y novel) se guardan estructurados en la BD
-            batch_data.append({
-                "user_id": user_id,
-                "archivo": nombre_archivo,
-                "miRNA": match_identificado,
-                "secuencia": secuencia,
-                "clasificacion": estado
-            })
+                if len(batch) >= BATCH_SIZE:
+                    db.bulk_insert_mappings(IdentifiedMirna, batch)
+                    db.commit()
+                    batch = []
 
-            total_procesados += 1
-            if len(batch_data) >= BATCH_SIZE:
-                db.bulk_insert_mappings(MirnaClassificationReport, batch_data)
+        # Solo top-N novel por frecuencia → DB
+        novels_buffer.sort(key=lambda x: x[0], reverse=True)
+        for _, payload in novels_buffer[:MAX_NOVEL_TO_DB]:
+            batch.append(payload)
+            if len(batch) >= BATCH_SIZE:
+                db.bulk_insert_mappings(IdentifiedMirna, batch)
                 db.commit()
-                batch_data = []
+                batch = []
 
-        if batch_data:
-            db.bulk_insert_mappings(MirnaClassificationReport, batch_data)
+        if batch:
+            db.bulk_insert_mappings(IdentifiedMirna, batch)
             db.commit()
 
-        # 4. ACTUALIZAR EL ESTADO DEL JOB A "completado" para este usuario
         db.query(PipelineJobStatus).filter(
             PipelineJobStatus.user_id == user_id,
-            PipelineJobStatus.tipo == "miRBase Classification"
-        ).update({"estado": "completado"})
+            PipelineJobStatus.tipo == "miRBase Classification",
+        ).update({"estado": "completado", "validos_guardados": total_conocidos})
         db.commit()
 
         t_total = time.time() - t_inicio
-        print(f"\n✅ ¡Clasificación finalizada para el usuario {user_id}! {total_procesados:,} registros procesados en {t_total:.2f} segundos.\n")
+        print(
+            f"Clasificación OK user={user_id}: {total_procesados:,} secuencias únicas, "
+            f"{total_conocidos:,} conocidos/seed, "
+            f"{min(len(novels_buffer), MAX_NOVEL_TO_DB)} novel en DB "
+            f"({t_total:.2f}s)"
+        )
 
     except Exception as e:
         db.rollback()
         db.query(PipelineJobStatus).filter(
             PipelineJobStatus.user_id == user_id,
-            PipelineJobStatus.tipo == "miRBase Classification"
+            PipelineJobStatus.tipo == "miRBase Classification",
         ).update({"estado": "error", "detalle_error": str(e)})
         db.commit()
-        print(f"❌ [Background] Error crítico en clasificación para el usuario {user_id}: {str(e)}")
+        print(f"Error clasificación user={user_id}: {e}")
     finally:
         db.close()
-
-
-
-"""
-los miRNAs conocidos (y los desconocidos/novel) se guardan exactamente
-igual en la base de datos dentro de la tabla MirnaClassificationReport. 
-La única diferencia es que el campo clasificacion almacena una etiqueta 
-descriptiva (por ejemplo, Conocido (HSA - ID Exacto: hsa-miR-21-5p) o
- Potencialmente Novedoso (Novel miRNA)) según el resultado de la comparación contra mature.fa.
- """

@@ -1,161 +1,165 @@
+import json
+from datetime import datetime, timezone
+
 import numpy as np
 import pandas as pd
-from datetime import datetime, timezone
-from sklearn.linear_model import LogisticRegression
 from sklearn.ensemble import RandomForestClassifier
-from xgboost import XGBClassifier
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import (
+    accuracy_score,
+    average_precision_score,
+    f1_score,
+    precision_score,
+    recall_score,
+    roc_auc_score,
+)
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import precision_score, recall_score, f1_score, roc_auc_score, average_precision_score
-from sqlalchemy.orm import Session
-from app.models.models import InteractionReport, PipelineJobStatus, MLModelMetricsReport
+
+from app.core.config import MODELS_DIR
+from app.models.models import InteractionCandidate, MLModelRun, PipelineJobStatus
 from app.services.database import SessionLocal
+
+FEATURE_COLS = [
+    "complementarity",
+    "seed_match",
+    "mismatches",
+    "delta_g",
+    "accessibility",
+    "match_length",
+    "num_matches",
+    "gaps",
+    "mirna_expression",
+]
+
 
 def entrenar_comparar_modelos_ml_background(user_id: int, transcriptome_id: int):
     """
-    Función optimizada para segundo plano que entrena, evalúa, almacena todas las métricas
-    en BD, emite logs detallados y guarda las interacciones priorizadas de forma masiva.
+    Entrena solo con filas etiquetadas (evidence + synthetic_negative).
+    Predice probabilidad sobre unlabeled.
     """
     db = SessionLocal()
     job_nombre = f"Machine Learning Prediction - Run #{transcriptome_id}"
-    
-    try:
-        print("\n" + "🧬 "*20)
-        print(f"🤖 [ML BACKGROUND] Iniciando pipeline de Machine Learning para Usuario ID: {user_id} | Transcriptoma ID: {transcriptome_id}")
-        print("🧬 "*20)
+    job_status = None
 
-        # 1. Registrar o actualizar estado de trabajo en la BD
+    try:
+        print(f"\n[ML] user={user_id} transcriptome={transcriptome_id}")
+
         job_status = db.query(PipelineJobStatus).filter_by(user_id=user_id, tipo=job_nombre).first()
         if not job_status:
-            job_status = PipelineJobStatus(user_id=user_id, archivo=f"transcriptome_{transcriptome_id}", tipo=job_nombre, estado="procesando")
+            job_status = PipelineJobStatus(
+                user_id=user_id,
+                archivo=f"transcriptome_{transcriptome_id}",
+                tipo=job_nombre,
+                estado="procesando",
+            )
             db.add(job_status)
         else:
             job_status.estado = "procesando"
             job_status.detalle_error = None
         db.commit()
 
-        print("📊 [ML Step 1/5] Extrayendo matriz de características desde la base de datos...")
-        interacciones_db = db.query(InteractionReport).filter_by(user_id=user_id, transcriptome_id=transcriptome_id).all()
-        
-        if not interacciones_db:
-            raise ValueError(f"No se encontraron interacciones previas calculadas para el usuario {user_id} y transcriptoma {transcriptome_id}.")
+        rows = (
+            db.query(InteractionCandidate)
+            .filter_by(user_id=user_id, transcriptome_id=transcriptome_id)
+            .all()
+        )
+        if not rows:
+            raise ValueError("No hay interacciones previas para entrenar.")
 
-        datos_lista = []
-        for row in interacciones_db:
-            datos_lista.append({
-                "miRNA": row.miRNA,
-                "mRNA": row.mRNA,
-                "Complementariedad": row.complementariedad,
-                "Seed_Match": row.seed_match,
-                "Mismatches": row.mismatches,
-                "Delta_G": row.delta_g,
-                "Accesibilidad": row.accesibilidad
-            })
-        df_features = pd.DataFrame(datos_lista)
-        print(f"✅ Total de pares cargados para ML: {len(df_features)}")
+        def row_to_dict(r: InteractionCandidate) -> dict:
+            return {
+                "id": r.id,
+                "mirna_id": r.mirna_id,
+                "mrna_id": r.mrna_id,
+                "complementarity": r.complementarity or 0.0,
+                "seed_match": r.seed_match or 0,
+                "mismatches": r.mismatches or 0,
+                "delta_g": r.delta_g if r.delta_g is not None else 0.0,
+                "accessibility": r.accessibility if r.accessibility is not None else 0.0,
+                "match_length": r.match_length or 0,
+                "num_matches": r.num_matches or 0,
+                "gaps": r.gaps or 0,
+                "mirna_expression": r.mirna_expression or 0.0,
+                "label": r.label,
+                "label_source": r.label_source,
+            }
 
-        # 2. Definir variables predictoras y objetivo
-        print("⚙️ [ML Step 2/5] Preparando matrices de entrenamiento y división (60% Train, 20% Val, 20% Test)...")
-        X = df_features[["Complementariedad", "Seed_Match", "Mismatches", "Delta_G", "Accesibilidad"]]
-        
-        np.random.seed(42)
-        y = np.random.choice([0, 1], size=len(X), p=[0.75, 0.25])
+        df_all = pd.DataFrame([row_to_dict(r) for r in rows])
+        labeled = df_all[df_all["label"].isin([0, 1])].copy()
 
-        X_temp, X_test, y_temp, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
-        X_train, X_val, y_train, y_val = train_test_split(X_temp, y_temp, test_size=0.25, random_state=42)
+        if len(labeled) < 20 or labeled["label"].nunique() < 2:
+            # Fallback documentado: si aún no hay etiquetas suficientes,
+            # usar seed_match como proxy débil SOLO para demo local (no evidencia biológica).
+            print("[ML] Etiquetas insuficientes; usando proxy seed_match (solo desarrollo).")
+            df_all["label"] = df_all["seed_match"].astype(int)
+            labeled = df_all.copy()
+            for r in rows:
+                if r.label is None:
+                    r.label = int(r.seed_match or 0)
+                    r.label_source = "proxy_seed_dev"
+            db.commit()
 
-        # 3. Modelos a evaluar
+        X = labeled[FEATURE_COLS].fillna(0)
+        y = labeled["label"].astype(int)
+
+        X_temp, X_test, y_temp, y_test = train_test_split(
+            X, y, test_size=0.2, random_state=42, stratify=y if y.nunique() > 1 else None
+        )
+        X_train, X_val, y_train, y_val = train_test_split(
+            X_temp, y_temp, test_size=0.25, random_state=42,
+            stratify=y_temp if y_temp.nunique() > 1 else None,
+        )
+
+        model_version = datetime.now(timezone.utc).strftime("v%Y%m%d%H%M%S")
         modelos = {
-            "Logistic Regression": LogisticRegression(random_state=42),
+            "Logistic Regression": LogisticRegression(max_iter=500, random_state=42),
             "Random Forest": RandomForestClassifier(n_estimators=100, random_state=42),
-            "XGBoost": XGBClassifier(use_label_encoder=False, eval_metric='logloss', random_state=42)
         }
 
-        metricas_resultados = []
-        modelos_entrenados = {}
+        db.query(MLModelRun).filter_by(user_id=user_id, transcriptome_id=transcriptome_id).delete()
+        db.commit()
 
-        print("🥊 [ML Step 3/5] Entrenando, evaluando y guardando métricas de modelos...")
-        
-        # Limpiar métricas anteriores de este transcriptoma si existieran para evitar duplicados en re-ejecuciones
-        db.query(MLModelMetricsReport).filter_by(user_id=user_id, transcriptome_id=transcriptome_id).delete()
+        modelos_entrenados = {}
+        best_name = "Random Forest"
 
         for nombre, modelo in modelos.items():
-            print(f"    -> Entrenando modelo: {nombre}...")
             modelo.fit(X_train, y_train)
             modelos_entrenados[nombre] = modelo
-
             y_pred = modelo.predict(X_test)
-            y_pred_proba = modelo.predict_proba(X_test)[:, 1]
+            y_proba = modelo.predict_proba(X_test)[:, 1] if hasattr(modelo, "predict_proba") else y_pred
 
-            prec = precision_score(y_test, y_pred, zero_division=0)
-            rec = recall_score(y_test, y_pred, zero_division=0)
-            f1 = f1_score(y_test, y_pred, zero_division=0)
-            roc_auc = roc_auc_score(y_test, y_pred_proba)
-            pr_auc = average_precision_score(y_test, y_pred_proba)
-
-            # Guardar registro individual de métricas en la nueva tabla
-            metric_report = MLModelMetricsReport(
+            run = MLModelRun(
                 user_id=user_id,
                 transcriptome_id=transcriptome_id,
-                modelo=nombre,
-                precision=round(float(prec), 4),
-                recall=round(float(rec), 4),
-                f1_score=round(float(f1), 4),
-                roc_auc=round(float(roc_auc), 4),
-                pr_auc=round(float(pr_auc), 4)
+                model_version=model_version,
+                model_name=nombre,
+                training_dataset=f"user_{user_id}_tr_{transcriptome_id}",
+                features_used=json.dumps(FEATURE_COLS),
+                hyperparameters=json.dumps({"random_state": 42}),
+                accuracy=round(float(accuracy_score(y_test, y_pred)), 4),
+                precision=round(float(precision_score(y_test, y_pred, zero_division=0)), 4),
+                recall=round(float(recall_score(y_test, y_pred, zero_division=0)), 4),
+                f1_score=round(float(f1_score(y_test, y_pred, zero_division=0)), 4),
+                roc_auc=round(float(roc_auc_score(y_test, y_proba)), 4) if len(np.unique(y_test)) > 1 else None,
+                pr_auc=round(float(average_precision_score(y_test, y_proba)), 4) if len(np.unique(y_test)) > 1 else None,
+                plots_dir=str(MODELS_DIR / f"user_{user_id}" / model_version),
             )
-            db.add(metric_report)
+            db.add(run)
 
-            metricas_resultados.append({
-                "modelo": nombre,
-                "precision": round(float(prec), 4),
-                "recall": round(float(rec), 4),
-                "f1_score": round(float(f1), 4),
-                "roc_auc": round(float(roc_auc), 4),
-                "pr_auc": round(float(pr_auc), 4)
-            })
+        db.commit()
 
-        db.commit() # Confirmar guardado masivo de métricas
+        rf = modelos_entrenados[best_name]
+        X_all = df_all[FEATURE_COLS].fillna(0)
+        proba = rf.predict_proba(X_all)[:, 1]
 
-        df_metricas = pd.DataFrame(metricas_resultados)
-        print("\n=== TABLA COMPARATIVA DE RENDIMIENTO DE MODELOS ===")
-        print(df_metricas.to_markdown(index=False))
-
-        # 4. Importancia de variables
-        print("\n🔍 [ML Step 4/5] Extrayendo importancia de variables predictoras...")
-        rf_model = modelos_entrenados["Random Forest"]
-        importancias = pd.DataFrame({
-            "caracteristica": X.columns,
-            "importancia": rf_model.feature_importances_
-        }).sort_values(by="importancia", ascending=False)
-        print(importancias.to_markdown(index=False))
-
-        # 5. Asignar score y actualizar base de datos por bloques masivos (Bulk Update)
-        print("\n📈 [ML Step 5/5] Calculando scores de probabilidad globales y actualizando registros masivamente...")
-        df_features["interaction_score_ml"] = rf_model.predict_proba(X)[:, 1]
-        
-        actualizaciones = []
-        for _, row in df_features.iterrows():
-            actualizaciones.append({
-                "user_id": user_id,
-                "transcriptome_id": transcriptome_id,
-                "miRNA": row["miRNA"],
-                "mRNA": row["mRNA"],
-                "interaction_score": float(row["interaction_score_ml"])
-            })
-
-        # Ejecución por lotes para evitar sobrecarga en memoria y base de datos
-        BATCH_SIZE = 5000
-        for i in range(0, len(actualizaciones), BATCH_SIZE):
-            lote = actualizaciones[i:i + BATCH_SIZE]
-            db.bulk_update_mappings(InteractionReport, lote)
-            db.commit()
+        for idx, r in enumerate(rows):
+            r.ml_probability = float(proba[idx])
+            r.model_version = model_version
+        db.commit()
 
         job_status.estado = "completado"
         db.commit()
-
-        print("\n" + "🏁 "*20)
-        print(f"🎉 [ML BACKGROUND] ¡Entrenamiento de Machine Learning finalizado con éxito para Usuario #{user_id}!")
-        print("🏁 "*20 + "\n")
+        print(f"[ML] OK version={model_version} labeled={len(labeled)} total={len(df_all)}")
 
     except Exception as e:
         db.rollback()
@@ -164,29 +168,6 @@ def entrenar_comparar_modelos_ml_background(user_id: int, transcriptome_id: int)
             job_status.estado = "error"
             job_status.detalle_error = str(e)
             db.commit()
-        print(f"❌ [ML Error] Falló el pipeline de ML para el usuario {user_id}: {str(e)}")
+        print(f"[ML Error] {e}")
     finally:
         db.close()
-"""
-Gestión de Estado Inicial (PipelineJobStatus): 
-El sistema abre una sesión independiente en segundo plano y busca o registra el estado del proceso bajo
- el nombre del trabajo de Machine Learning asociado al transcriptoma. 
-Esto permite que el frontend consulte el progreso en tiempo real mediante el endpoint unificado 
-/pipeline-status/{user_id}.Extracción de la Matriz de Características ($X$): Consulta la base de
- datos para recuperar todos los pares miRNA-mRNA generados previamente en la tabla InteractionReport 
- filtrando estrictamente por el user_id y el transcriptome_id. Los datos se transforman en una estructura 
- tabular de Pandas.Preparación y División de Datos: Separa las variables predictoras (Complementariedad,
- Seed_Match, Mismatches, Delta_G, Accesibilidad) y define una etiqueta objetivo (y). Posteriormente, divide 
- el conjunto de datos de forma estricta (60% entrenamiento, 20% validación y 20% prueba) para evitar 
- sobreajuste (overfitting).Entrenamiento y Evaluación Multi-Modelo: Itera sobre tres algoritmos de 
- clasificación de alto rendimiento:Regresión Logística: Modelo lineal base de referencia.
- Random Forest: Modelo de ensamblaje basado en árboles, excelente para capturar interacciones no lineales.
- XGBoost: Gradient Boosting optimizado para velocidad y precisión tabular.Para cada uno calcula métricas e
- stándar de clasificación médica y bioinformática: Precision, Recall, F1-Score, ROC-AUC y PR-AUC 
- (Precision-Recall AUC).Análisis de Importancia de Variables: Utiliza el modelo de Random Forest entrenado
-   para extraer la jerarquía de importancia de las características bioinformáticas (identificando qué peso
-     tienen factores como la complementariedad o la energía libre $\Delta G$).Priorización y Persistencia 
-     Final: Calcula las probabilidades de interacción real (predict_proba) para cada par, a
-     ctualiza el campo interaction_score directamente en la base de datos de manera optimizada 
-     y marca el trabajo como completado.
-"""

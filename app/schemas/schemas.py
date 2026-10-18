@@ -1,15 +1,84 @@
-from pydantic import BaseModel
-from typing import Optional, Dict, Any
+from datetime import datetime
+from typing import Any, Dict, List, Optional
 
-class FileValidationResponse(BaseModel):
+from pydantic import BaseModel, ConfigDict
+
+
+class FileValidationItem(BaseModel):
+    role: str
     filename: str
-    format: str
     status: str
-    path: str
+    format_ok: Optional[bool] = None
+    size_ok: Optional[bool] = None
+    structure_ok: Optional[bool] = None
+    looks_like_mirna: Optional[bool] = None
+    total_records: Optional[int] = None
+    invalid_records: Optional[int] = None
+    avg_quality: Optional[float] = None
+    detail: Optional[str] = None
+
+
+class JobStatusItem(BaseModel):
+    archivo: Optional[str] = None
+    tipo: Optional[str] = None
+    estado: Optional[str] = None
+    total_leidos: Optional[int] = None
+    validos_guardados: Optional[int] = None
+    descartados: Optional[int] = None
+    error: Optional[str] = None
+
+
+class MirnaSummaryItem(BaseModel):
+    archivo: str
+    collapsed_path: str
+    total_reads: int
+    reads_after_qc: int
+    unique_sequences: int
+    discarded: int
+    min_len: Optional[int] = None
+    max_len: Optional[int] = None
+
+
+class TranscriptomeSummaryItem(BaseModel):
+    id: int
+    archivo: str
+    total_transcritos: Optional[int] = None
+    transcritos_validos: Optional[int] = None
+    longitud_minima_bp: Optional[int] = None
+    longitud_maxima_bp: Optional[int] = None
+    longitud_promedio_bp: Optional[float] = None
+    index_path: Optional[str] = None
+
+
+class ValidationStatusResponse(BaseModel):
+    status: str
+    user_id: int
+    mensaje: Optional[str] = None
+    validaciones: List[FileValidationItem] = []
+    jobs: List[JobStatusItem] = []
+    mirna_summary: Optional[MirnaSummaryItem] = None
+    transcriptome_summary: Optional[TranscriptomeSummaryItem] = None
+    next_steps: List[str] = []
+
 
 class PipelineUploadResponse(BaseModel):
     message: str
-    pipeline_status: Dict[str, Any]
+    user_id: int
+    archivos_en_proceso: List[str]
+    rango_mirna_aplicado: Dict[str, int]
+    storage_policy: str
+    mirbase_status: Dict[str, Any]
+    validation_get: str
+    input_summary_get: str
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
+
+
+class InputSummaryResponse(BaseModel):
+    status: str
+    user_id: int
+    mensaje: Optional[str] = None
+    input_files: List[Dict[str, Any]] = []
+    mirna_summaries: List[MirnaSummaryItem] = []
+    transcriptome_summaries: List[TranscriptomeSummaryItem] = []
+    validation_get: str
