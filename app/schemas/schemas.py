@@ -74,6 +74,35 @@ class PipelineUploadResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
 
 
+class ModelMetricItem(BaseModel):
+    model_name: str
+    model_version: Optional[str] = None
+    accuracy: Optional[float] = None
+    precision: Optional[float] = None
+    recall: Optional[float] = None
+    f1_score: Optional[float] = None
+    roc_auc: Optional[float] = None
+
+
+class AnalysisReportDocument(BaseModel):
+    """Metadatos del informe de la búsqueda actual antes de descargar el PDF."""
+
+    user_id: int
+    transcriptome_id: int
+    archivo: Optional[str] = None
+    generated_at: datetime
+    n_interactions: int
+    n_identified_mirnas: int
+    mean_complementarity: Optional[float] = None
+    mean_delta_g: Optional[float] = None
+    seed_match_fraction: Optional[float] = None
+    model_version: Optional[str] = None
+    models: List[ModelMetricItem] = []
+    plots: List[str] = []
+    pdf_url: str
+    top_pairs: List[Dict[str, Any]] = []
+
+
 class InputSummaryResponse(BaseModel):
     status: str
     user_id: int

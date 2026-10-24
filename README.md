@@ -153,17 +153,24 @@ Si `status` es `error`, mira `mensaje` / `detalle_error` del job.
 
 ### 5) Machine Learning
 
-Opción corta (métricas en DB):
+Regresión logística y Random Forest se comparan porque el dataset es tabular y de tamaño moderado: la logística muestra el peso lineal de cada feature (coeficientes) y el bosque captura relaciones no lineales (importancia Gini). Cada entrenamiento reutiliza los pares ya etiquetados de ese usuario.
 
 `POST /api/v1/ml/entrenar-interacciones/{user_id}`
 
 Luego: `GET /api/v1/ml/metricas/{user_id}`
 
-Opción con gráficos Matplotlib:
+Gráficos en `data/Visuales/user_{id}_run_{transcriptome_id}/`:
+ROC, precision-recall, importancia, histograma de complementariedad, ΔG vs complementariedad y conteo de seed match.
 
-`POST /api/v1/ml/pipeline-completo/{user_id}`
+Hay que volver a calcular interacciones para que ΔG y complementariedad salgan del dúplex (Biopython + NumPy), no de la fórmula anterior.
 
-Plots en: `data/Visuales/user_{id}_run_{transcriptome_id}/`
+### 6) PDF de la búsqueda actual
+
+`GET /api/v1/report/{user_id}` devuelve el schema (conteos, métricas, pares top, lista de gráficos).
+
+`GET /api/v1/report/{user_id}/pdf` descarga el PDF de esa búsqueda.
+
+La variante con nivel de evidencia es `POST /api/v1/ml/pipeline-completo/{user_id}` (usa el mismo entrenamiento y añade la etiqueta de evidencia).
 
 ---
 
@@ -187,6 +194,9 @@ app/
     mirbase_service.py
     interaction_service.py
     mml_service.py
+    binding_affinity.py   # complementariedad y ΔG
+    plots_service.py
+    report_service.py
     validation.py
     database.py
 data/

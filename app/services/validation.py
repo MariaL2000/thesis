@@ -7,20 +7,17 @@ import pandas as pd
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import (
     average_precision_score,
     precision_recall_curve,
     roc_auc_score,
     roc_curve,
 )
-from sklearn.model_selection import train_test_split
 
 from app.core.config import VISUALS_DIR
-from app.models.models import InteractionCandidate, PipelineJobStatus
+from app.models.models import InteractionCandidate
 from app.services.database import SessionLocal
-from app.services.mml_service import FEATURE_COLS, entrenar_comparar_modelos_ml_background as _train_core
+from app.services.mml_service import entrenar_comparar_modelos_ml_background as _train_core
 
 VISUAL_DIR = VISUALS_DIR
 
@@ -113,7 +110,6 @@ def entrenar_comparar_modelos_ml_background(
     _train_core(user_id, transcriptome_id)
 
     db = SessionLocal()
-    job_nombre = f"Machine Learning Prediction - Run #{transcriptome_id}"
     try:
         rows = (
             db.query(InteractionCandidate)
@@ -123,60 +119,24 @@ def entrenar_comparar_modelos_ml_background(
         if not rows:
             return
 
-        datos = []
-        for r in rows:
-            datos.append(
+        df = pd.DataFrame(
+            [
                 {
                     "id": r.id,
                     "mirna_id": r.mirna_id,
-                    "mrna_id": r.mrna_id,
-                    "complementarity": r.complementarity or 0.0,
-                    "seed_match": r.seed_match or 0,
-                    "mismatches": r.mismatches or 0,
                     "delta_g": r.delta_g if r.delta_g is not None else 0.0,
-                    "accessibility": r.accessibility if r.accessibility is not None else 0.0,
-                    "match_length": r.match_length or 0,
-                    "num_matches": r.num_matches or 0,
-                    "gaps": r.gaps or 0,
-                    "mirna_expression": r.mirna_expression or 0.0,
-                    "label": r.label if r.label is not None else 0,
+                    "seed_match": r.seed_match or 0,
                     "ml_probability": r.ml_probability or 0.0,
                 }
-            )
-        df = pd.DataFrame(datos)
-        X = df[FEATURE_COLS].fillna(0)
-        y = df["label"].astype(int)
-
-        if y.nunique() < 2 or len(df) < 10:
-            return
-
-        X_train, X_test, y_train, y_test = train_test_split(
-            X, y, test_size=0.2, random_state=42, stratify=y
+                for r in rows
+            ]
         )
-        modelos = {
-            "Logistic Regression": LogisticRegression(max_iter=500, random_state=42),
-            "Random Forest": RandomForestClassifier(n_estimators=100, random_state=42),
-        }
-        trained = {}
-        for nombre, modelo in modelos.items():
-            modelo.fit(X_train, y_train)
-            trained[nombre] = modelo
-
-        plots_dir = generar_y_guardar_graficos_ml(trained, X_test, y_test, user_id, transcriptome_id)
         df = validar_predicciones_biologicamente(df, ruta_dataset_externo)
-
         for _, row in df.iterrows():
             db.query(InteractionCandidate).filter_by(id=int(row["id"])).update(
                 {"evidence": str(row.get("evidence", ""))}
             )
         db.commit()
-
-        job = db.query(PipelineJobStatus).filter_by(user_id=user_id, tipo=job_nombre).first()
-        if job:
-            job.estado = "completado"
-            db.commit()
-        print(f"[VISUALES] Guardados en {plots_dir}")
-
     except Exception as e:
         print(f"[validation pipeline] {e}")
     finally:

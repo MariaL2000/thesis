@@ -8,6 +8,7 @@ from Bio import SeqIO
 from Bio.Seq import Seq
 
 from app.core.config import LABEL_SOURCE_SYNTHETIC_NEGATIVE, LABEL_SOURCE_UNLABELED, user_raw_dir
+from app.services.binding_affinity import score_binding
 from app.models.models import (
     IdentifiedMirna,
     InteractionCandidate,
@@ -108,40 +109,11 @@ def calcular_caracteristicas_streaming(
                 if pos < 0:
                     continue
 
-                coincidencias = t_seq.count(seed_rc)
-                complementariedad = round(min(0.98, 0.75 + (0.04 * min(coincidencias, 5))), 2)
-                mismatches = max(0, 2 - min(coincidencias, 2))
-                delta_g = round(-12.5 - (coincidencias * 3.2), 2)
-                accesibilidad = round(0.50 + ((len(t_id) % 45) / 100.0), 2)
-                alignment_score = round(
-                    (complementariedad * 0.4) + ((abs(delta_g) / 50.0) * 0.4) + (accesibilidad * 0.2),
-                    3,
-                )
-
+                bio = score_binding(m["secuencia"], t_seq, seed_pos=pos)
                 datos.append(
-                    {
-                        "mirna_id": m["miRNA"],
-                        "mrna_id": t_id,
-                        "gene_id": None,
-                        "seed_match": 1,
-                        "seed_position": pos,
-                        "match_length": len(seed_rc),
-                        "num_matches": coincidencias,
-                        "mismatches": mismatches,
-                        "gaps": 0,
-                        "indels": 0,
-                        "complementarity": complementariedad,
-                        "alignment_score": alignment_score,
-                        "site_position": pos,
-                        "site_length": len(seed_rc),
-                        "delta_g": delta_g,
-                        "accessibility": accesibilidad,
-                        "conservation": None,
-                        "mirna_expression": float(m["read_count"]),
-                        "mrna_expression": None,
-                        "label": None,
-                        "label_source": LABEL_SOURCE_UNLABELED,
-                    }
+                    _fila_interaccion(
+                        m, t_id, bio, label=None, label_source=LABEL_SOURCE_UNLABELED
+                    )
                 )
                 pares_por_mirna[m["miRNA"]] += 1
 
@@ -186,35 +158,44 @@ def _synthetic_negatives(
                     continue
                 if m["seed_rc"] in t_seq:
                     continue
+                bio = score_binding(m["secuencia"], t_seq, seed_pos=None)
+                bio["seed_match"] = 0
+                bio["seed_position"] = None
                 out.append(
-                    {
-                        "mirna_id": m["miRNA"],
-                        "mrna_id": t_id,
-                        "gene_id": None,
-                        "seed_match": 0,
-                        "seed_position": None,
-                        "match_length": 0,
-                        "num_matches": 0,
-                        "mismatches": len(m["seed"]),
-                        "gaps": 0,
-                        "indels": 0,
-                        "complementarity": 0.1,
-                        "alignment_score": 0.05,
-                        "site_position": None,
-                        "site_length": 0,
-                        "delta_g": 0.0,
-                        "accessibility": 0.3,
-                        "conservation": None,
-                        "mirna_expression": float(m["read_count"]),
-                        "mrna_expression": None,
-                        "label": 0,
-                        "label_source": LABEL_SOURCE_SYNTHETIC_NEGATIVE,
-                    }
+                    _fila_interaccion(
+                        m, t_id, bio, label=0, label_source=LABEL_SOURCE_SYNTHETIC_NEGATIVE
+                    )
                 )
                 counts[m["miRNA"]] += 1
             if all(v >= n_per_mirna for v in counts.values()):
                 break
     return out
+
+
+def _fila_interaccion(mirna: dict, transcript_id: str, bio: dict, label, label_source: str) -> dict:
+    return {
+        "mirna_id": mirna["miRNA"],
+        "mrna_id": transcript_id,
+        "gene_id": None,
+        "seed_match": int(bio.get("seed_match") or 0),
+        "seed_position": bio.get("seed_position"),
+        "match_length": bio.get("match_length"),
+        "num_matches": bio.get("num_matches"),
+        "mismatches": int(bio.get("mismatches") or 0),
+        "gaps": int(bio.get("gaps") or 0),
+        "indels": int(bio.get("indels") or 0),
+        "complementarity": float(bio.get("complementarity") or 0.0),
+        "alignment_score": bio.get("alignment_score"),
+        "site_position": bio.get("site_position"),
+        "site_length": bio.get("site_length"),
+        "delta_g": bio.get("delta_g"),
+        "accessibility": bio.get("accessibility"),
+        "conservation": None,
+        "mirna_expression": float(mirna["read_count"]),
+        "mrna_expression": None,
+        "label": label,
+        "label_source": label_source,
+    }
 
 
 def _select_mirnas_for_interaction(mirnas_guardados: list, limit: int = MAX_MIRNAS_FOR_INTERACTION) -> list:
